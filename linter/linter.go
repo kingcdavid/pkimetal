@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,7 @@ type Linter struct {
 	NumInstances          int
 	ReqChannel            chan LintingRequest
 	ReadySignal           string // If set, an external backend emits this line once it has finished initialising.
+	ProfileNameOnWire     bool   // If set, an external backend is sent the profile name rather than the numeric ProfileId.
 	external              bool
 	useHandleRequest      bool
 	queueTimeSummary      prometheus.Summary
@@ -115,6 +117,11 @@ const (
 var ErrResponseTooLong = errors.New("stdout response line exceeds 16 MiB limit")
 
 func (l *Linter) Register() {
+	for _, existing := range Linters {
+		if existing.Name == l.Name {
+			panic(fmt.Sprintf("linter %q is already registered", l.Name))
+		}
+	}
 	Linters = append(Linters, l)
 	if l.NumInstances > 0 {
 		// Register this linter.
@@ -233,7 +240,7 @@ func (lin *LinterInstance) startInstance_external(directory, cmd string, arg ...
 	}(lin, lin.stderr)
 
 	// Start the linter backend.
-	lin.command.Start()
+	err = lin.command.Start()
 	if lin.command.Process == nil {
 		logger.Logger.Fatal("Cmd.Start() failed", zap.Error(err), zap.String("cmd", cmd), zap.String("directory", directory), zap.String("name", lin.Name))
 	}
@@ -306,6 +313,17 @@ func (lin *LinterInstance) sendResult(lreq *LintingRequest, lres LintingResult) 
 	case <-lreq.Ctx.Done():
 		return false
 	}
+}
+
+// wireProfile returns how a request's profile is identified on an external
+// backend's STDIN.  Built-in backends receive the numeric ProfileId; backends
+// that set ProfileNameOnWire (e.g. exec plugins) receive the profile name, since
+// the numeric IDs can change between pkimetal releases.
+func (l *Linter) wireProfile(id ProfileId) string {
+	if l.ProfileNameOnWire {
+		return AllProfiles[id].Name
+	}
+	return strconv.Itoa(int(id))
 }
 
 // parseResultToken parses a single response token emitted by an external linter
@@ -525,7 +543,7 @@ func (lin *LinterInstance) serverLoop(ctx context.Context, lif LinterInterface) 
 				responseTooLong := false
 			label_forloop:
 				// Write the request to the linter backend's STDIN.
-				for _, err = lin.Stdin.Write(utils.S2B(fmt.Sprintf("%d\n%s\n", lreq.ProfileId, strings.TrimSpace(lreq.B64Input)))); err == nil; {
+				for _, err = lin.Stdin.Write(utils.S2B(fmt.Sprintf("%s\n%s\n", lin.wireProfile(lreq.ProfileId), strings.TrimSpace(lreq.B64Input)))); err == nil; {
 					// Scan the next token from the linter backend's STDOUT.
 					if !lin.Stdout.Scan() {
 						if err = lin.Stdout.Err(); err == nil {

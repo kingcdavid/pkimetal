@@ -27,6 +27,9 @@ import (
 	_ "github.com/pkimetal/pkimetal/linter/section7"
 	_ "github.com/pkimetal/pkimetal/linter/x509lint"
 	_ "github.com/pkimetal/pkimetal/linter/zlint"
+
+	// Operator-supplied (see doc/linters/plugins.md):
+	_ "github.com/pkimetal/pkimetal/linter/plugin"
 )
 
 func main() {

@@ -16,6 +16,20 @@ import (
 	"go.uber.org/zap"
 )
 
+// PluginConfig declares an exec plugin: an operator-supplied executable that
+// pkimetal runs as a long-lived linter backend.  See doc/linters/plugins.md.
+type PluginConfig struct {
+	Name         string   `mapstructure:"name"`
+	Command      string   `mapstructure:"command"`
+	Args         []string `mapstructure:"args"`
+	Dir          string   `mapstructure:"dir"`
+	NumProcesses *int     `mapstructure:"numProcesses"` // nil = default (1); 0 = disabled.
+	ReadySignal  bool     `mapstructure:"readySignal"`
+	Artifacts    []string `mapstructure:"artifacts"`
+	Version      string   `mapstructure:"version"`
+	Url          string   `mapstructure:"url"`
+}
+
 type config struct {
 	Server struct {
 		WebserverPort        int           `mapstructure:"webserverPort"`
@@ -90,6 +104,7 @@ type config struct {
 		Zlint struct {
 			NumGoroutines int `mapstructure:"numGoroutines"`
 		}
+		Plugins []PluginConfig `mapstructure:"plugins"`
 	}
 	Response struct {
 		DefaultFormat   string `mapstructure:"defaultFormat"`

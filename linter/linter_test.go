@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -212,7 +215,7 @@ const helperArg = "pkimetal-backend-helper"
 // linter backend.  It only activates when invoked with the helperArg sentinel,
 // so during a normal `go test` run it is a no-op.
 //
-// Protocol: for each request it reads a profile-id line and an input line, then
+// Protocol: for each request it reads a profile line and an input line, then
 // emits result token(s) terminated by the end-of-results sentinel.  The input
 // line doubles as a behaviour marker.
 func TestHelperProcess(t *testing.T) {
@@ -224,11 +227,14 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(PKIMETAL_READY)
 	}
 	in := bufio.NewScanner(os.Stdin)
-	for in.Scan() { // Profile-id line.
+	for in.Scan() { // Profile line.
+		profile := in.Text()
 		if !in.Scan() { // Input line.
 			break
 		}
 		switch in.Text() {
+		case "ECHOPROFILE": // Report the profile line exactly as received.
+			fmt.Println("I: profile=" + profile)
 		case "CRASH": // Exit without emitting the sentinel (simulates a crash/desync).
 			os.Exit(1)
 		case "OVERSIZED": // Emit a response line beyond the production stdout limit.
@@ -247,6 +253,35 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(PKIMETAL_ENDOFRESULTS)
 	}
 	os.Exit(0)
+}
+
+// TestHelperStartFailure is not a real test: it is re-executed by
+// TestStartInstanceExternal_LogsStartError to start a backend that cannot be
+// executed.  It only activates when PKIMETAL_TEST_UNRUNNABLE is set.
+func TestHelperStartFailure(t *testing.T) {
+	path := os.Getenv("PKIMETAL_TEST_UNRUNNABLE")
+	if path == "" {
+		return
+	}
+	lin := &LinterInstance{Linter: &Linter{Name: "unrunnable"}}
+	lin.startInstance_external(".", path)
+	os.Exit(0) // Not reached: startInstance_external exits via logger.Fatal.
+}
+
+func TestStartInstanceExternal_LogsStartError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unrunnable")
+	if err := os.WriteFile(path, []byte("not a program\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperStartFailure$")
+	cmd.Env = append(os.Environ(), "PKIMETAL_TEST_UNRUNNABLE="+path)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected the helper to exit via logger.Fatal; output:\n%s", output)
+	}
+	if !strings.Contains(string(output), "Cmd.Start() failed") || !strings.Contains(string(output), "exec format error") {
+		t.Errorf("the fatal log line should include why the backend could not be started; got:\n%s", output)
+	}
 }
 
 func TestExternalStdinWriteDeadline(t *testing.T) {
@@ -472,10 +507,14 @@ func startExternalStub(t *testing.T, readySignal string, extraArgs ...string) (l
 // runLint submits one request and collects results until the end-of-results
 // sentinel arrives or the request context is done.
 func runLint(lin *LinterInstance, ctx context.Context, input string) []LintingResult {
+	return runLintProfile(lin, ctx, input, 0)
+}
+
+func runLintProfile(lin *LinterInstance, ctx context.Context, input string, profileId ProfileId) []LintingResult {
 	lreq := LintingRequest{
 		Ctx:         ctx,
 		B64Input:    input,
-		ProfileId:   0,
+		ProfileId:   profileId,
 		QueuedAt:    time.Now(),
 		RespChannel: make(chan LintingResult),
 	}
@@ -526,6 +565,50 @@ func TestBackend_CleanRequest(t *testing.T) {
 	if backendPID(lin) != pid {
 		t.Error("backend should not have restarted on a clean request")
 	}
+}
+
+func TestBackend_ProfileOnWire(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		nameOnWire bool
+		want       string
+	}{
+		{"built-in linters get the numeric ID", false, "profile=" + strconv.Itoa(int(TBR_LEAF_TLSSERVER_OV))},
+		{"plugins get the profile name", true, "profile=tbr_leaf_tlsserver_ov"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lin, stop := startStubBackend(t, "")
+			defer stop()
+			lin.ProfileNameOnWire = tc.nameOnWire // Ordered before serverLoop reads it by the request channel send.
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results := runLintProfile(lin, ctx, "ECHOPROFILE", TBR_LEAF_TLSSERVER_OV)
+
+			var got []string
+			for _, r := range results {
+				if r.Severity == SEVERITY_INFO {
+					got = append(got, r.Finding)
+				}
+			}
+			if len(got) != 1 || got[0] != tc.want {
+				t.Errorf("backend received %q, want [%q]", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegister_RejectsDuplicateName(t *testing.T) {
+	saved := Linters
+	t.Cleanup(func() { Linters = saved })
+
+	(&Linter{Name: "duplicate-test"}).Register() // NumInstances 0: no instances or metrics are created.
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), `linter "duplicate-test" is already registered`) {
+			t.Fatalf("expected a duplicate-name panic, got %v", r)
+		}
+	}()
+	(&Linter{Name: "duplicate-test"}).Register()
 }
 
 func TestBackend_OversizedResponseDoesNotRestart(t *testing.T) {
